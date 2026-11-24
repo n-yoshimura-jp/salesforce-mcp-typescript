@@ -20,7 +20,8 @@ export class SalesforceError extends Error {
 /** fetch のネットワークエラー（URL間違い・オフライン等）を分かりやすくする */
 async function safeFetch(url: string, init: RequestInit): Promise<Response> {
   try {
-    return await fetch(url, init);
+    // リダイレクト先に秘密情報やトークンが送られないよう、リダイレクトはエラーにする
+    return await fetch(url, { ...init, redirect: "error" });
   } catch (e) {
     const cause = (e as { cause?: { code?: string; message?: string } }).cause;
     const detail = cause?.code ?? cause?.message ?? String(e);
@@ -54,6 +55,10 @@ export class SalesforceClient {
     this.clientId = requireEnv("SF_CLIENT_ID");
     this.clientSecret = requireEnv("SF_CLIENT_SECRET");
     this.apiVersion = process.env.SF_API_VERSION?.trim() || "66.0";
+    // URL に埋め込むので、形式（例: 66.0）をチェックする
+    if (!/^\d+\.\d+$/.test(this.apiVersion)) {
+      throw new Error("SF_API_VERSION は 66.0 のような形式にしてください");
+    }
   }
 
   /** アクセストークンを取得してキャッシュする */
@@ -76,6 +81,10 @@ export class SalesforceClient {
     }
 
     const data = JSON.parse(text) as TokenResponse;
+    // トークンを平文で送らないよう、API の接続先も https に限る（レスポンス本文はトークンを含むので出さない）
+    if (!data.access_token || !data.instance_url?.startsWith("https://")) {
+      throw new Error("認証レスポンスが不正です（access_token がない、または instance_url が https ではありません）");
+    }
     this.accessToken = data.access_token;
     this.instanceUrl = data.instance_url;
   }

@@ -61,8 +61,8 @@ Salesforce では Spring '26 から接続アプリケーション（Connected Ap
 書類（~/Documents）やデスクトップに置くと、Claude Desktop から起動したときに
 macOS のアクセス許可で読み込めないことがあるため、ホーム直下の ~/dev に作ります。
 
-検証環境: Node.js 22 / @modelcontextprotocol/server 2.4.0 / zod 4.6 /
-TypeScript 7.0（2026年11月23日時点の最新版）。ビルドし、模擬 Salesforce API に
+検証環境: Node.js 26 / @modelcontextprotocol/server 2.4.0 / zod 4.6 /
+TypeScript 7.0（2026年11月24日時点の最新版）。ビルドし、模擬 Salesforce API に
 対して全ツールの動作を確認済みです。
 
 
@@ -70,11 +70,12 @@ TypeScript 7.0（2026年11月23日時点の最新版）。ビルドし、模擬 
 ■ Step 1: Node.js を用意する
 ----------------------------------------------------------------
 
-Node.js 20.12 以上（推奨は LTS 版）が必要です。まずターミナルで確認します。
+Node.js 22 以上（推奨は LTS 版）が必要です。Node.js 20 はサポートが終了しているので
+使わないでください。まずターミナルで確認します。
 
   node -v
 
-  - v20.12.0 以上が表示されれば OK
+  - v22.0.0 以上が表示されれば OK
   - command not found や古いバージョンなら、https://nodejs.org/ から LTS 版の
     macOS インストーラー（.pkg）を入れ、ターミナルを開き直してもう一度確認
 
@@ -332,8 +333,12 @@ VS Code で作りたい場合は、cat の行と EOF の行を除いた中身を
 【4-2. src/salesforce.ts（認証と CRUD の API 呼び出し）】
 
 トークンを取得して保持し、期限切れ（HTTP 401）のときは自動で1回だけ再認証します。
-コンシューマーの秘密を平文で送らないよう、SF_LOGIN_URL が https:// 以外のときは
-起動時にエラーにします。トークンはメモリ上にだけ保持し、ファイルには保存しません。
+トークンはメモリ上にだけ保持し、ファイルには保存しません。秘密情報やトークンを
+守るため、次の場合はエラーにします。
+  - SF_LOGIN_URL が https:// 以外（起動時）
+  - SF_API_VERSION が 66.0 のような形式ではない（起動時）
+  - 認証レスポンスの接続先（instance_url）が https:// 以外
+  - 接続先がリダイレクトを返した（転送先に秘密情報が再送されるのを防ぐ）
 
 cat > src/salesforce.ts <<'EOF'
 // Salesforce REST API の小さなクライアント
@@ -358,7 +363,8 @@ export class SalesforceError extends Error {
 /** fetch のネットワークエラー（URL間違い・オフライン等）を分かりやすくする */
 async function safeFetch(url: string, init: RequestInit): Promise<Response> {
   try {
-    return await fetch(url, init);
+    // リダイレクト先に秘密情報やトークンが送られないよう、リダイレクトはエラーにする
+    return await fetch(url, { ...init, redirect: "error" });
   } catch (e) {
     const cause = (e as { cause?: { code?: string; message?: string } }).cause;
     const detail = cause?.code ?? cause?.message ?? String(e);
@@ -392,6 +398,10 @@ export class SalesforceClient {
     this.clientId = requireEnv("SF_CLIENT_ID");
     this.clientSecret = requireEnv("SF_CLIENT_SECRET");
     this.apiVersion = process.env.SF_API_VERSION?.trim() || "66.0";
+    // URL に埋め込むので、形式（例: 66.0）をチェックする
+    if (!/^\d+\.\d+$/.test(this.apiVersion)) {
+      throw new Error("SF_API_VERSION は 66.0 のような形式にしてください");
+    }
   }
 
   /** アクセストークンを取得してキャッシュする */
@@ -414,6 +424,10 @@ export class SalesforceClient {
     }
 
     const data = JSON.parse(text) as TokenResponse;
+    // トークンを平文で送らないよう、API の接続先も https に限る（レスポンス本文はトークンを含むので出さない）
+    if (!data.access_token || !data.instance_url?.startsWith("https://")) {
+      throw new Error("認証レスポンスが不正です（access_token がない、または instance_url が https ではありません）");
+    }
     this.accessToken = data.access_token;
     this.instanceUrl = data.instance_url;
   }
@@ -528,7 +542,7 @@ stdout は通信専用なので、ログはすべて console.error に出しま�
 （console.log を使うと通信が壊れます）。
 ログはファイル（~/Library/Logs/Claude/）に残るため、Salesforce のエラー本文
 （SOQL の条件値などが含まれることがある）は出さず、HTTP ステータスだけを記録します。
-エラーの詳細は Claude 側にだけ返します。
+エラーの詳細は Claude 側にだけ返します。MCP の通信エラーも、メッセージだけを記録します。
 
 cat > src/index.ts <<'EOF'
 #!/usr/bin/env node
@@ -716,7 +730,8 @@ function createServer(): McpServer {
 }
 
 serveStdio(createServer, {
-  onerror: (err) => console.error("[salesforce-mcp] error:", err),
+  // ログファイルに余計な情報を残さないよう、メッセージだけを出す
+  onerror: (err) => console.error("[salesforce-mcp] error:", err.message),
 });
 console.error("[salesforce-mcp] stdio で起動しました");
 EOF
@@ -966,6 +981,14 @@ Salesforce のごみ箱から復元できます。
   ・接続できません (ENOTFOUND)
       原因: SF_LOGIN_URL の打ち間違い
       対処: 2-1 の URL をコピーし直す
+
+  ・接続できません (unexpected redirect)
+      原因: SF_LOGIN_URL が My Domain の URL になっていない
+      対処: 2-1 の URL（.my.salesforce.com で終わるもの）をコピーし直す
+
+  ・SF_API_VERSION は 66.0 のような形式にしてください
+      原因: SF_API_VERSION に v や余計な文字が入っている
+      対処: .env の値を 66.0 のように数字とピリオドだけにする
 
   ・request not supported on this domain
       原因: login.salesforce.com を使っている

@@ -30,8 +30,9 @@ Claude Desktop ──(stdio)──▶ salesforce-mcp-typescript ──(OAuth 2.0
 
 - **パスワード不要の認証**: 外部クライアントアプリケーション（External Client App）の Client Credentials Flow を使うため、ユーザーのパスワードやセキュリティトークンを保存しません。
 - **秘密情報はコードに書かない**: 接続情報は環境変数から読み込みます。`.env` は `.gitignore` で Git の対象外にしています。
-- **HTTPS 以外を拒否**: `SF_LOGIN_URL` が `https://` で始まらない場合は起動時にエラーにします。
-- **入力チェック**: URL に埋め込むオブジェクト名とレコード ID を、正規表現で厳しくチェックします（パスの書き換えを防止）。
+- **HTTPS 以外を拒否**: `SF_LOGIN_URL` と、認証後に受け取る API の接続先（`instance_url`）のどちらも、`https://` 以外ならエラーにします。
+- **リダイレクトを追わない**: 転送先にコンシューマーの秘密やアクセストークンが再送されないよう、リダイレクトはエラーにします。
+- **入力チェック**: URL に埋め込むオブジェクト名・レコード ID・API バージョンを、正規表現で厳しくチェックします（パスの書き換えを防止）。
 - **トークンはメモリ上だけ**: アクセストークンはファイルに保存せず、期限切れ（HTTP 401）のときだけ1回再認証します。
 - **ログは最小限**: ログファイル（`~/Library/Logs/Claude/`）には HTTP ステータスだけを記録します。SOQL の条件値などを含むエラー本文は Claude にだけ返します。
 
@@ -157,6 +158,7 @@ salesforce-mcp-typescript/
 │   ├── salesforce.ts   # Salesforce REST API クライアント（認証・CRUD）
 │   └── check.ts        # 接続確認用スクリプト（npm run check）
 ├── salesforce-mcp-setup-guide.txt  # Salesforce の設定を含む詳しい構築手順
+├── LICENSE
 ├── package.json
 └── tsconfig.json
 ```
@@ -174,6 +176,10 @@ tail -n 50 ~/Library/Logs/Claude/mcp-server-salesforce.log
 - [MCP TypeScript SDK v2 ドキュメント](https://ts.sdk.modelcontextprotocol.io/v2/)
 - [Connect to local MCP servers](https://modelcontextprotocol.io/docs/develop/connect-local-servers)
 - [Salesforce: クライアントログイン情報フロー用の外部クライアントアプリの作成](https://developer.salesforce.com/docs/industries/loyalty/guide/authorization.html)
+
+## ライセンス
+
+[MIT License](./LICENSE)
 
 ## 免責事項
 

@@ -183,6 +183,7 @@ function createServer(): McpServer {
 }
 
 serveStdio(createServer, {
-  onerror: (err) => console.error("[salesforce-mcp] error:", err),
+  // ログファイルに余計な情報を残さないよう、メッセージだけを出す
+  onerror: (err) => console.error("[salesforce-mcp] error:", err.message),
 });
 console.error("[salesforce-mcp] stdio で起動しました");
