@@ -1,0 +1,1047 @@
+================================================================
+Salesforce CRUD MCPサーバー（TypeScript）構築手順 — Claude Desktop for Mac
+2026年11月23日
+================================================================
+
+----------------------------------------------------------------
+■ 全体像
+----------------------------------------------------------------
+
+Claude Desktop が自作の MCP サーバー（Node.js）を起動し、そのサーバーが
+Salesforce REST API でレコードの作成・取得・更新・削除を行います。
+所要時間は30〜40分です。
+
+仕組み:
+  Claude Desktop →（stdio）→ salesforce-mcp（TypeScript）
+  →（OAuth クライアントログイン情報フロー）→ Salesforce REST API
+
+【作るツール（6個）】
+
+  ツール名            操作     内容
+  ------------------  -------  ------------------------------------------
+  sf_query            Read     SOQL で検索（例: 取引先を10件）
+  sf_get_record       Read     ID で1件取得（項目指定も可）
+  sf_create_record    Create   レコードを1件作成してIDを返す
+  sf_update_record    Update   指定した項目だけ更新
+  sf_delete_record    Delete   削除（ごみ箱へ移動）
+  sf_describe_object  補助     項目のAPI参照名・型・必須・選択リスト値を取得
+
+オブジェクト名は引数で受け取るため、標準オブジェクト・カスタムオブジェクトの
+どちらも操作できます（実行ユーザーの権限とオブジェクト自体の仕様の範囲内）。
+
+【前提】
+
+  - Mac に Claude Desktop がインストール済み
+  - Salesforce Developer Edition にシステム管理者でログインできる
+  - ターミナル（アプリケーション → ユーティリティ → ターミナル）を使う
+
+【認証方式について】
+
+Salesforce では Spring '26 から接続アプリケーション（Connected App）の
+新規作成が既定で無効になり、後継の外部クライアントアプリケーション（ECA）は
+ユーザー名・パスワードフローに対応していません。そのため、ECA で使える
+サーバー間認証の「クライアントログイン情報フロー（Client Credentials Flow）」を
+使います。パスワードやセキュリティトークンは不要です。
+  参考: https://www.salesforce.com/blog/spring-26-release-architect-highlights/
+
+【完成後のフォルダ構成】
+
+  ~/dev/salesforce-mcp/
+  ├── .env              ← Salesforce の接続情報（秘密情報）
+  ├── .gitignore        ← Git に含めないファイルの一覧（.env など）
+  ├── package.json
+  ├── tsconfig.json
+  ├── src/
+  │   ├── index.ts      ← MCP サーバー本体（ツール定義）
+  │   ├── salesforce.ts ← Salesforce API クライアント（認証・CRUD）
+  │   └── check.ts      ← 接続確認用スクリプト
+  ├── dist/             ← ビルド後の JavaScript（自動生成）
+  └── node_modules/     ← 自動生成
+
+書類（~/Documents）やデスクトップに置くと、Claude Desktop から起動したときに
+macOS のアクセス許可で読み込めないことがあるため、ホーム直下の ~/dev に作ります。
+
+検証環境: Node.js 22 / @modelcontextprotocol/server 2.4.0 / zod 4.6 /
+TypeScript 7.0（2026年11月23日時点の最新版）。ビルドし、模擬 Salesforce API に
+対して全ツールの動作を確認済みです。
+
+
+----------------------------------------------------------------
+■ Step 1: Node.js を用意する
+----------------------------------------------------------------
+
+Node.js 20.12 以上（推奨は LTS 版）が必要です。まずターミナルで確認します。
+
+  node -v
+
+  - v20.12.0 以上が表示されれば OK
+  - command not found や古いバージョンなら、https://nodejs.org/ から LTS 版の
+    macOS インストーラー（.pkg）を入れ、ターミナルを開き直してもう一度確認
+
+次に node の絶対パスを控えます（Step 6 で使います）。
+
+  which node
+
+表示例:
+  - 公式インストーラー:       /usr/local/bin/node
+  - Homebrew（Apple Silicon）: /opt/homebrew/bin/node
+  - nvm:                       /Users/あなたのユーザー名/.nvm/versions/node/v24.x.x/bin/node
+
+Claude Desktop はターミナルと違い PATH を引き継がないため、設定で「node」とだけ
+書くと起動に失敗することがあります。必ずこの絶対パスを使ってください。
+
+
+----------------------------------------------------------------
+■ Step 2: Salesforce 側の設定（外部クライアントアプリ）
+----------------------------------------------------------------
+
+このステップで控えるのは「My Domain の URL・コンシューマー鍵・
+コンシューマーの秘密」の3つです。画面の表記は日本語 UI のもので、
+括弧内が英語 UI の表記です。作成中の外部クライアントアプリがあれば、
+それを使って 2-2 以降の設定を確認するだけで構いません。
+
+【2-1. My Domain の URL を確認する】
+
+  1. Salesforce 右上の歯車 → 設定（Setup）
+  2. クイック検索に「私のドメイン」と入力 → 私のドメイン（My Domain）
+  3. 「現在の [私のドメイン] の URL」を控える
+     （例: yourname-dev-ed.develop.my.salesforce.com）
+
+これに https:// を付けたものが SF_LOGIN_URL になります。クライアントログイン情報
+フローは login.salesforce.com では使えないので、必ず My Domain の URL を使います。
+
+【2-2. 外部クライアントアプリケーションを作成する】
+
+  1. 設定のクイック検索に「外部クライアント」と入力
+     → 外部クライアントアプリケーションマネージャー（External Client App Manager）
+  2. 新規外部クライアントアプリケーション（New External Client App）をクリック
+  3. 基本情報を入力
+     - 外部クライアントアプリケーション名: Claude MCP（API 参照名は自動入力）
+     - 取引先メール: 自分のメールアドレス
+     - 配布状態（Distribution State）: ローカル（Local）
+  4. 「API（OAuth 設定の有効化）」で OAuth を有効化（Enable OAuth）にチェック
+  5. コールバック URL: https://login.salesforce.com/services/oauth2/success
+     （今回は使いませんが入力必須です）
+  6. OAuth 範囲: 「API を使用してユーザーデータを管理（api）」を
+     「選択した OAuth 範囲」へ移動
+  7. フローの有効化（Flow Enablement）:
+     「クライアントログイン情報フローを有効化（Enable Client Credentials Flow）」に
+     チェック → 確認ダイアログで OK
+  8. セキュリティ欄は既定のまま → 作成（Create）
+
+【2-3. ポリシーで「実行ユーザー」を指定する】
+
+クライアントログイン情報フローでは、API がここで指定したユーザーの権限で動きます。
+この設定がないと認証できません。
+
+  1. 作成したアプリの画面で ポリシー（Policies）タブ → 編集（Edit）
+  2. 「OAuth フローと外部クライアントアプリケーションの拡張
+     （OAuth Flows and External Client App Enhancements）」で
+     「クライアントログイン情報フローを有効化」にチェック
+  3. 「別のユーザーとして実行（Run As (Username)）」に、自分が Salesforce に
+     ログインするときのユーザー名（メール形式）を入力
+  4. 保存（Save）
+
+実行ユーザーがシステム管理者だと、Claude は全データを更新・削除できます。
+Developer Edition の練習用なら問題ありませんが、実業務の組織では権限を絞った
+連携用ユーザーを指定してください。
+  - 例: ユーザーライセンス「Salesforce Integration」＋ プロファイル
+    「Minimum Access - API Only Integrations」のユーザーを作り、操作させたい
+    オブジェクト・項目の権限だけを権限セットで付与する
+  - この方法なら、画面からログインできず、付与した範囲しか API で操作できない
+
+【2-4. コンシューマー鍵と秘密を取得する】
+
+  1. 同じアプリ画面で 設定（Settings）タブ →「OAuth 設定」を開く
+  2. コンシューマーの鍵と秘密（Consumer Key and Secret）をクリック
+  3. メールで届く確認コードを入力
+  4. 「コンシューマー鍵」と「コンシューマーの秘密」を表示したままにしておき、
+     Step 5-1 で .env に直接貼り付ける
+
+【秘密情報の扱い】
+  - コンシューマーの秘密はパスワードと同じです。メモアプリ、チャット
+    （Claude との会話を含む）、メール、スクリーンショットに残さないでください
+  - 画面を閉じてしまっても、2-4 の手順でいつでも再表示できます
+  - 漏れた可能性があるときは、すぐにコンシューマーの秘密を再生成（ローテーション）
+    して .env を書き換えてください。古い秘密はそれで使えなくなります
+
+設定の反映に数分（長いときは10分程度）かかることがあります。Step 5 で認証エラーが
+出たら少し待ってから再実行してください。
+  参考: https://developer.salesforce.com/docs/industries/loyalty/guide/authorization.html
+
+
+----------------------------------------------------------------
+■ Step 3: プロジェクトフォルダを作る
+----------------------------------------------------------------
+
+以降のコマンドは、ブロックごとコピーしてターミナルに貼り付け、Enter で実行します。
+
+【3-1. フォルダを作って移動する】
+
+  mkdir -p ~/dev/salesforce-mcp/src
+  cd ~/dev/salesforce-mcp
+
+【3-2. package.json を作って編集する】
+
+まずコマンドで雛形を作ります。
+
+  npm init -y
+
+次にエディタで開きます（VS Code なら下のコマンドでフォルダごと開けます）。
+テキストエディットは引用符が自動で変わり JSON が壊れるので使わないでください。
+VS Code がない場合は nano package.json でも編集できます。
+
+  open -a "Visual Studio Code" .
+
+編集① scripts: "test" の行を、build と check の2行に置き換えます。
+
+  変更前:
+    "scripts": {
+      "test": "echo \"Error: no test specified\" && exit 1"
+    },
+
+  変更後:
+    "scripts": {
+      "build": "tsc",
+      "check": "node dist/check.js"
+    },
+
+編集② type: MCP SDK が ES モジュール専用なので "type": "module" にします。
+npm のバージョンで生成内容が違うので、どちらかに合わせてください。
+
+  - 最後に "type": "commonjs" がある → "commonjs" を "module" に書き換える
+  - "type" の行がない → "license": "ISC" の行末に , を付け、次の行に
+    "type": "module" を追加する
+
+編集後は次のようになります（name はフォルダ名が自動で入ります）。保存して次へ進みます。
+
+  {
+    "name": "salesforce-mcp",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {
+      "build": "tsc",
+      "check": "node dist/check.js"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "type": "module"
+  }
+
+次の 3-3 でパッケージを入れると、dependencies と devDependencies は自動で
+追記されます。
+
+【3-3. パッケージをインストールする】
+
+  npm install @modelcontextprotocol/server@2 zod@4
+  npm install -D typescript@7 @types/node
+
+  - @modelcontextprotocol/server: MCP 公式 TypeScript SDK（v2）のサーバー用パッケージ
+  - zod: ツールの入力チェック用
+  - typescript / @types/node: ビルド用（開発時のみ）
+
+Salesforce の接続は Node.js 標準の fetch で行うので、jsforce などの追加ライブラリは
+不要です。found 0 vulnerabilities などが表示され、エラーがなければ次へ進みます。
+脆弱性が報告された場合は npm audit で内容を確認してください。
+
+【3-4. .gitignore を作る】
+
+.env（秘密情報）や自動生成されるフォルダを Git に含めないための設定です。
+いま Git を使っていなくても、あとで git init したときに .env を誤って
+コミットしないよう、秘密情報を書き込む前（Step 5 の前）に作っておきます。
+
+cat > .gitignore <<'EOF'
+# 秘密情報（Salesforce の接続情報）
+.env
+.env.*
+
+# 自動生成（npm install / npm run build で再作成できる）
+node_modules/
+dist/
+
+# ログ・macOS が作るファイル
+*.log
+npm-debug.log*
+.DS_Store
+EOF
+
+  項目            理由
+  --------------  ------------------------------------------------------------
+  .env / .env.*   コンシューマー鍵・秘密が入っている。.env.local などの派生も除外
+  node_modules/   npm install で再作成できる。容量が大きい
+  dist/           npm run build で再作成できる
+  *.log 等        ログに接続先やエラー内容が残ることがある
+  .DS_Store       macOS の Finder が自動で作るファイル
+
+Git で管理する場合は、最初のコミットの前に git status を実行し、.env が
+一覧に出ていないことを確認してください。もし .env をコミットしてしまったら、
+履歴から消すだけでは不十分なので、コンシューマーの秘密を再生成してください。
+
+
+----------------------------------------------------------------
+■ Step 4: ソースコードを作る
+----------------------------------------------------------------
+
+tsconfig.json をコマンドで作って編集したあと、src の3ファイルを作ります。
+src の各ブロックは「cat > ...」の行から最後の「EOF」の行までまとめてコピーし、
+~/dev/salesforce-mcp にいる状態のターミナルに貼り付けます。
+VS Code で作りたい場合は、cat の行と EOF の行を除いた中身を同名ファイルに
+保存しても同じです。
+
+【4-1. tsconfig.json を作って編集する】
+
+3-3 で入れた TypeScript で雛形を作ります。
+
+  npx tsc --init
+
+「Created a new tsconfig.json」と出たら、tsconfig.json を開いて次の3か所を
+変えます。// で始まる行はコメント（無効）で、// を消すと有効になります。
+
+  場所                  変更前                      変更後
+  --------------------  --------------------------  --------------------------
+  File Layout           // "rootDir": "./src",      "rootDir": "./src",
+  File Layout           // "outDir": "./dist",      "outDir": "./dist",
+  Environment Settings  "types": [],                "types": ["node"],
+
+編集後の先頭部分は次のようになります。それ以外の行（"module": "nodenext" や
+"strict": true など）はそのままで構いません。
+
+  {
+    // Visit https://aka.ms/tsconfig to read more about this file
+    "compilerOptions": {
+      // File Layout
+      "rootDir": "./src",
+      "outDir": "./dist",
+
+      // Environment Settings
+      // See also https://aka.ms/tsconfig/module
+      "module": "nodenext",
+      "target": "esnext",
+      "types": ["node"],
+      ...
+
+  - rootDir と outDir は先頭の // を消すだけで、値はそのままで OK
+    （Step 6 の設定と npm run check が dist を参照します）
+  - すぐ下の「// For nodejs:」の下にあるコメント行 // "types": ["node"], は
+    触らずそのままで OK
+  - この雛形は TypeScript 7 のものです。3-3 で typescript@7 を入れていれば
+    同じ内容になります
+
+【4-2. src/salesforce.ts（認証と CRUD の API 呼び出し）】
+
+トークンを取得して保持し、期限切れ（HTTP 401）のときは自動で1回だけ再認証します。
+コンシューマーの秘密を平文で送らないよう、SF_LOGIN_URL が https:// 以外のときは
+起動時にエラーにします。トークンはメモリ上にだけ保持し、ファイルには保存しません。
+
+cat > src/salesforce.ts <<'EOF'
+// Salesforce REST API の小さなクライアント
+// 認証: OAuth 2.0 クライアントログイン情報フロー（Client Credentials Flow）
+
+type TokenResponse = {
+  access_token: string;
+  instance_url: string;
+  token_type: string;
+};
+
+export class SalesforceError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "SalesforceError";
+  }
+}
+
+/** fetch のネットワークエラー（URL間違い・オフライン等）を分かりやすくする */
+async function safeFetch(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e) {
+    const cause = (e as { cause?: { code?: string; message?: string } }).cause;
+    const detail = cause?.code ?? cause?.message ?? String(e);
+    throw new Error(`Salesforce に接続できません (${detail}): ${new URL(url).origin} — SF_LOGIN_URL やネット接続を確認してください`);
+  }
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`環境変数 ${name} が設定されていません（.env を確認してください）`);
+  }
+  return value;
+}
+
+export class SalesforceClient {
+  private readonly loginUrl: string;
+  private readonly clientId: string;
+  private readonly clientSecret: string;
+  private readonly apiVersion: string;
+
+  private accessToken: string | null = null;
+  private instanceUrl: string | null = null;
+
+  constructor() {
+    this.loginUrl = requireEnv("SF_LOGIN_URL").replace(/\/+$/, "");
+    // 秘密情報を平文で送らないよう、https 以外は拒否する
+    if (!this.loginUrl.startsWith("https://")) {
+      throw new Error("SF_LOGIN_URL は https:// で始まる My Domain の URL にしてください");
+    }
+    this.clientId = requireEnv("SF_CLIENT_ID");
+    this.clientSecret = requireEnv("SF_CLIENT_SECRET");
+    this.apiVersion = process.env.SF_API_VERSION?.trim() || "66.0";
+  }
+
+  /** アクセストークンを取得してキャッシュする */
+  private async authenticate(): Promise<void> {
+    const body = new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: this.clientId,
+      client_secret: this.clientSecret,
+    });
+
+    const res = await safeFetch(`${this.loginUrl}/services/oauth2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new SalesforceError(`認証に失敗しました (HTTP ${res.status}): ${text}`, res.status);
+    }
+
+    const data = JSON.parse(text) as TokenResponse;
+    this.accessToken = data.access_token;
+    this.instanceUrl = data.instance_url;
+  }
+
+  /** REST API を呼び出す。トークン切れ(401)のときは1回だけ再認証してやり直す */
+  async request<T = unknown>(
+    method: "GET" | "POST" | "PATCH" | "DELETE",
+    path: string,
+    body?: unknown,
+    retry = true,
+  ): Promise<T> {
+    if (!this.accessToken || !this.instanceUrl) {
+      await this.authenticate();
+    }
+
+    const url = `${this.instanceUrl}/services/data/v${this.apiVersion}${path}`;
+    const res = await safeFetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: body === undefined ? null : JSON.stringify(body),
+    });
+
+    if (res.status === 401 && retry) {
+      this.accessToken = null;
+      return this.request<T>(method, path, body, false);
+    }
+
+    // 更新・削除の成功時は 204 No Content（本文なし）
+    if (res.status === 204) {
+      return undefined as T;
+    }
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new SalesforceError(`Salesforce API エラー (HTTP ${res.status}): ${text}`, res.status);
+    }
+    return (text ? JSON.parse(text) : undefined) as T;
+  }
+
+  // ---- CRUD ----
+
+  query(soql: string) {
+    return this.request<{ totalSize: number; done: boolean; records: Record<string, unknown>[] }>(
+      "GET",
+      `/query?q=${encodeURIComponent(soql)}`,
+    );
+  }
+
+  getRecord(objectName: string, id: string, fields?: string[]) {
+    const qs = fields && fields.length > 0 ? `?fields=${encodeURIComponent(fields.join(","))}` : "";
+    return this.request<Record<string, unknown>>("GET", `/sobjects/${objectName}/${id}${qs}`);
+  }
+
+  createRecord(objectName: string, fields: Record<string, unknown>) {
+    return this.request<{ id: string; success: boolean; errors: unknown[] }>(
+      "POST",
+      `/sobjects/${objectName}`,
+      fields,
+    );
+  }
+
+  updateRecord(objectName: string, id: string, fields: Record<string, unknown>) {
+    return this.request<void>("PATCH", `/sobjects/${objectName}/${id}`, fields);
+  }
+
+  deleteRecord(objectName: string, id: string) {
+    return this.request<void>("DELETE", `/sobjects/${objectName}/${id}`);
+  }
+
+  describe(objectName: string) {
+    return this.request<{
+      name: string;
+      label: string;
+      fields: {
+        name: string;
+        label: string;
+        type: string;
+        nillable: boolean;
+        createable: boolean;
+        updateable: boolean;
+        defaultedOnCreate: boolean;
+        picklistValues?: { value: string; active: boolean }[];
+        referenceTo?: string[];
+      }[];
+    }>("GET", `/sobjects/${objectName}/describe`);
+  }
+}
+
+/** レコードから Salesforce が付ける "attributes" を取り除いて見やすくする */
+export function stripAttributes(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripAttributes);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "attributes") continue;
+      out[k] = stripAttributes(v);
+    }
+    return out;
+  }
+  return value;
+}
+EOF
+
+【4-3. src/index.ts（MCP サーバー本体）】
+
+6つのツールを登録し、stdio（標準入出力）で Claude Desktop と通信します。
+stdout は通信専用なので、ログはすべて console.error に出します
+（console.log を使うと通信が壊れます）。
+ログはファイル（~/Library/Logs/Claude/）に残るため、Salesforce のエラー本文
+（SOQL の条件値などが含まれることがある）は出さず、HTTP ステータスだけを記録します。
+エラーの詳細は Claude 側にだけ返します。
+
+cat > src/index.ts <<'EOF'
+#!/usr/bin/env node
+// Salesforce CRUD 用 MCP サーバー（stdio）
+// 注意: stdout は MCP の通信に使うので、ログは必ず console.error（stderr）に出す
+
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { McpServer } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import * as z from "zod/v4";
+import { SalesforceClient, SalesforceError, stripAttributes } from "./salesforce.js";
+
+// プロジェクト直下の .env を読み込む（dist/index.js から見て1つ上の階層）
+const envPath = join(dirname(fileURLToPath(import.meta.url)), "..", ".env");
+if (existsSync(envPath)) {
+  process.loadEnvFile(envPath);
+}
+
+const sf = new SalesforceClient();
+
+// 入力チェック用（URL に埋め込むので厳しめに）
+const objectName = z
+  .string()
+  .regex(/^[A-Za-z][A-Za-z0-9_]*$/, "オブジェクトのAPI参照名（例: Account, Contact, MyObject__c）")
+  .describe("オブジェクトのAPI参照名。例: Account, Contact, Opportunity, MyObject__c");
+const recordId = z
+  .string()
+  .regex(/^[a-zA-Z0-9]{15}([a-zA-Z0-9]{3})?$/, "15桁または18桁のレコードID")
+  .describe("レコードID（15桁または18桁）");
+const fieldValues = z
+  .record(z.string(), z.unknown())
+  .describe('項目のAPI参照名と値の組。例: {"Name": "テスト株式会社", "Phone": "03-1234-5678"}');
+
+function ok(data: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+}
+
+function fail(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  // エラー本文には SOQL の条件値などが含まれることがあるため、ログには HTTP ステータスだけを残す
+  const status = error instanceof SalesforceError ? `HTTP ${error.status}` : "接続または設定のエラー";
+  console.error("[salesforce-mcp] ツールの実行に失敗しました:", status);
+  return { content: [{ type: "text" as const, text: message }], isError: true };
+}
+
+function createServer(): McpServer {
+  const server = new McpServer({ name: "salesforce", version: "1.0.0" });
+
+  // ---------- Read: SOQL ----------
+  server.registerTool(
+    "sf_query",
+    {
+      title: "SOQLでレコードを検索",
+      description:
+        "SOQLを実行してレコードを取得します。例: SELECT Id, Name FROM Account ORDER BY CreatedDate DESC LIMIT 10。件数が多くなりそうなときは必ず LIMIT を付けてください。",
+      inputSchema: z.object({
+        soql: z.string().min(1).describe("実行するSOQL文"),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ soql }) => {
+      try {
+        const result = await sf.query(soql);
+        return ok({ totalSize: result.totalSize, done: result.done, records: stripAttributes(result.records) });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ---------- Read: 1件取得 ----------
+  server.registerTool(
+    "sf_get_record",
+    {
+      title: "IDでレコードを1件取得",
+      description: "オブジェクト名とレコードIDを指定して1件取得します。fields を省略すると全項目を返します。",
+      inputSchema: z.object({
+        objectName,
+        id: recordId,
+        fields: z.array(z.string()).optional().describe("取得する項目のAPI参照名の配列（省略可）"),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ objectName, id, fields }) => {
+      try {
+        return ok(stripAttributes(await sf.getRecord(objectName, id, fields)));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ---------- Create ----------
+  server.registerTool(
+    "sf_create_record",
+    {
+      title: "レコードを作成",
+      description: "指定したオブジェクトにレコードを1件作成し、作成されたIDを返します。",
+      inputSchema: z.object({ objectName, fields: fieldValues }),
+      annotations: { readOnlyHint: false, destructiveHint: false },
+    },
+    async ({ objectName, fields }) => {
+      try {
+        const result = await sf.createRecord(objectName, fields);
+        return ok({ message: "作成しました", id: result.id });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ---------- Update ----------
+  server.registerTool(
+    "sf_update_record",
+    {
+      title: "レコードを更新",
+      description: "レコードIDを指定して、渡した項目だけを更新します。",
+      inputSchema: z.object({ objectName, id: recordId, fields: fieldValues }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+    },
+    async ({ objectName, id, fields }) => {
+      try {
+        await sf.updateRecord(objectName, id, fields);
+        return ok({ message: "更新しました", id });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ---------- Delete ----------
+  server.registerTool(
+    "sf_delete_record",
+    {
+      title: "レコードを削除",
+      description: "レコードIDを指定して削除します（ごみ箱に移動）。実行前に対象レコードをユーザーに確認してください。",
+      inputSchema: z.object({ objectName, id: recordId }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+    },
+    async ({ objectName, id }) => {
+      try {
+        await sf.deleteRecord(objectName, id);
+        return ok({ message: "削除しました", id });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ---------- 補助: 項目一覧 ----------
+  server.registerTool(
+    "sf_describe_object",
+    {
+      title: "オブジェクトの項目一覧を取得",
+      description:
+        "オブジェクトの項目（API参照名・型・必須かどうか・選択リスト値）を返します。作成や更新の前に、項目名がわからないときに使います。",
+      inputSchema: z.object({ objectName }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ objectName }) => {
+      try {
+        const d = await sf.describe(objectName);
+        const fields = d.fields.map((f) => ({
+          name: f.name,
+          label: f.label,
+          type: f.type,
+          requiredOnCreate: f.createable && !f.nillable && !f.defaultedOnCreate,
+          createable: f.createable,
+          updateable: f.updateable,
+          ...(f.picklistValues && f.picklistValues.length > 0
+            ? { picklistValues: f.picklistValues.filter((p) => p.active).map((p) => p.value) }
+            : {}),
+          ...(f.referenceTo && f.referenceTo.length > 0 ? { referenceTo: f.referenceTo } : {}),
+        }));
+        return ok({ name: d.name, label: d.label, fields });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  return server;
+}
+
+serveStdio(createServer, {
+  onerror: (err) => console.error("[salesforce-mcp] error:", err),
+});
+console.error("[salesforce-mcp] stdio で起動しました");
+EOF
+
+【4-4. src/check.ts（接続確認用）】
+
+Claude Desktop につなぐ前に、Salesforce に接続できるかを単体で確かめるための
+スクリプトです。
+
+cat > src/check.ts <<'EOF'
+// Salesforce への接続確認用スクリプト（MCP とは無関係に単体で動かす）
+// 実行: npm run check
+
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { SalesforceClient, stripAttributes } from "./salesforce.js";
+
+// プロジェクト直下の .env を読み込む（dist/check.js から見て1つ上の階層）
+const envPath = join(dirname(fileURLToPath(import.meta.url)), "..", ".env");
+if (existsSync(envPath)) {
+  process.loadEnvFile(envPath);
+}
+
+try {
+  const sf = new SalesforceClient();
+  const result = await sf.query("SELECT Id, Name FROM Account ORDER BY CreatedDate DESC LIMIT 5");
+  console.log("✅ 接続成功！ 取引先（最新5件）:");
+  console.log(JSON.stringify(stripAttributes(result.records), null, 2));
+} catch (e) {
+  console.error("❌ 接続失敗:", e instanceof Error ? e.message : e);
+  process.exit(1);
+}
+EOF
+
+
+----------------------------------------------------------------
+■ Step 5: 接続情報を設定してビルド・接続確認
+----------------------------------------------------------------
+
+接続情報はプロジェクト直下の .env にまとめ、サーバーが起動時に自動で読み込みます。
+Claude Desktop の設定ファイルに秘密情報を書かずに済みます。
+
+【5-1. .env を作る】
+
+まず雛形を作り、他人が読めないように権限を絞ります。
+
+cat > .env <<'EOF'
+SF_LOGIN_URL=https://yourname-dev-ed.develop.my.salesforce.com
+SF_CLIENT_ID=ここにコンシューマー鍵
+SF_CLIENT_SECRET=ここにコンシューマーの秘密
+SF_API_VERSION=66.0
+EOF
+chmod 600 .env
+
+次に nano で開いて、Step 2 で控えた値に書き換えます。
+
+  nano .env
+
+  1. 矢印キーで移動し、= の右側を実際の値に置き換える（⌘V で貼り付け可）
+  2. control + O → Enter で保存
+  3. control + X で終了
+
+  変数               入れる値
+  -----------------  --------------------------------------------------------
+  SF_LOGIN_URL       2-1 の My Domain URL（https:// 付き、末尾の / なし）
+  SF_CLIENT_ID       2-4 のコンシューマー鍵（3MVG9 で始まる長い文字列）
+  SF_CLIENT_SECRET   2-4 のコンシューマーの秘密
+  SF_API_VERSION     そのまま 66.0 で OK
+
+書くときの注意:
+  - 値を " で囲まない
+  - = の前後にスペースを入れない
+  - 貼り付けたときに前後に空白が入っていないか確認する
+
+最後に、自分だけが読み書きできる権限になっているか確認します。
+
+  ls -l .env
+
+  先頭が -rw------- なら OK です。-rw-r--r-- のように r が複数あるときは、
+  chmod 600 .env をもう一度実行してください。
+
+.env は 3-4 の .gitignore で Git の対象外になっています。cat .env などで中身を
+画面に表示したり、Claude との会話に貼り付けたりしないでください。
+
+【5-2. ビルドする】
+
+  npm run build
+
+何もエラーが出ずに終われば成功です。dist/ に index.js・salesforce.js・check.js が
+できます。
+
+【5-3. Salesforce への接続を確認する】
+
+  npm run check
+
+成功すると次のように取引先が表示されます（Developer Edition には最初から
+サンプル取引先があります）。
+
+  ✅ 接続成功！ 取引先（最新5件）:
+  [
+    {
+      "Id": "001xx000003DGb2AAG",
+      "Name": "Edge Communications"
+    },
+    ...
+  ]
+
+「❌ 接続失敗」と出たら、末尾の「トラブルシューティング」でメッセージを探して
+ください。ここが成功するまで Step 6 に進まないでください。
+
+
+----------------------------------------------------------------
+■ Step 6: Claude Desktop に登録する
+----------------------------------------------------------------
+
+Claude Desktop は ~/Library/Application Support/Claude/claude_desktop_config.json の
+mcpServers に書かれたサーバーを起動時に立ち上げます。書き方は A（自動・推奨）か
+B（手動）のどちらかです。
+  参考: https://modelcontextprotocol.io/docs/develop/connect-local-servers
+
+【6-A. コマンドで自動登録する（推奨）】
+
+~/dev/salesforce-mcp にいる状態で、下のブロックを丸ごと貼り付けます。既存の設定は
+残したまま salesforce だけを追加し、元のファイルを日時付きのバックアップ
+（claude_desktop_config.json.bak-日時、本人だけが読める権限）として保存します。
+node と index.js の絶対パスも自動で入ります。
+
+cd ~/dev/salesforce-mcp
+NODE_BIN="$(command -v node)" node -e '
+const fs = require("fs"), os = require("os"), path = require("path");
+const file = path.join(os.homedir(), "Library/Application Support/Claude/claude_desktop_config.json");
+fs.mkdirSync(path.dirname(file), { recursive: true });
+const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim() : "";
+const config = text ? JSON.parse(text) : {};
+if (text) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15);
+  const backup = `${file}.bak-${stamp}`;
+  fs.copyFileSync(file, backup);
+  fs.chmodSync(backup, 0o600);
+  console.log("バックアップ: " + backup);
+}
+config.mcpServers ??= {};
+config.mcpServers.salesforce = { command: process.env.NODE_BIN, args: [path.resolve("dist/index.js")] };
+fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+fs.chmodSync(file, 0o600);
+console.log("更新しました: " + file);
+console.log("登録済みのサーバー: " + Object.keys(config.mcpServers).join(", "));
+console.log(JSON.stringify({ salesforce: config.mcpServers.salesforce }, null, 2));
+'
+
+最後に、次のような salesforce の項目が表示されれば成功です。
+
+  {
+    "salesforce": {
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/Users/あなたのユーザー名/dev/salesforce-mcp/dist/index.js"]
+    }
+  }
+
+  - 設定ファイルにはほかの MCP サーバーの API キーなどが入っていることがあるため、
+    画面には salesforce の項目とサーバー名だけを表示しています
+  - node のパスは which node と同じもの（Homebrew なら /opt/homebrew/bin/node）を
+    使います。node の実体パス（/opt/homebrew/Cellar/node/バージョン/…）にすると、
+    brew upgrade で Node.js を更新したときに起動できなくなるためです
+
+【6-B. 手動で書く場合】
+
+  1. 画面上部のメニューバーで Claude → 設定…（Settings…）
+     （アプリ画面内の設定ではありません）
+  2. 左側の 開発者（Developer） → 構成を編集（Edit Config）
+  3. Finder で表示された claude_desktop_config.json を VS Code などで開く
+  4. mcpServers の中に下の salesforce を追加して保存
+     （パスは Step 1 の which node と、~/dev/salesforce-mcp で pwd を実行した
+     結果に置き換える）
+
+  {
+    "mcpServers": {
+      "salesforce": {
+        "command": "/usr/local/bin/node",
+        "args": ["/Users/あなたのユーザー名/dev/salesforce-mcp/dist/index.js"]
+      }
+    }
+  }
+
+  - 既に preferences など他の項目がある場合は消さずに、同じ階層に mcpServers を
+    追加する（項目の間の , に注意）
+  - パスに ~ や相対パスは使えない（必ず /Users/... からの絶対パス）
+
+【6-C. Claude Desktop を再起動する】
+
+ウィンドウを閉じるだけでは設定が読み直されません。Claude Desktop を前面にして
+⌘Q で完全に終了し、もう一度起動します。
+
+
+----------------------------------------------------------------
+■ Step 7: Claude Desktop で使ってみる
+----------------------------------------------------------------
+
+【7-1. 接続されているか確認する】
+
+  - Claude → 設定… → 開発者 で salesforce が「running（実行中）」になっている
+  - チャット入力欄の「+」（またはツールアイコン）を開くと、salesforce と
+    6つのツールが並んでいる（オフになっていたらオンにする）
+
+「failed」やエラー表示になっている場合は、「トラブルシューティング」のログの
+見方へ進んでください。
+
+【7-2. CRUD を試す】
+
+新しいチャットで、上から順に送ってみてください。
+
+  操作    送る文の例                                      使われるツール
+  ------  ----------------------------------------------  ------------------------------------
+  Read    Salesforce の取引先を作成日の新しい順に5件見せて  sf_query
+  Create  取引先「テスト株式会社」を作って。               sf_create_record
+          電話番号は 03-1234-5678
+  Update  さっき作った取引先の業種を小売にして             sf_describe_object → sf_update_record
+  Read    その取引先の名前・電話・業種を見せて             sf_get_record
+  Delete  テスト株式会社を削除して                         sf_delete_record
+
+ツールが初めて呼ばれるとき、Claude Desktop が実行を許可するか尋ねます。
+参照系（sf_query・sf_get_record・sf_describe_object）は常に許可でも構いませんが、
+作成・更新・削除は毎回内容を確認してから許可するのが安全です。削除したレコードは
+Salesforce のごみ箱から復元できます。
+
+レコードの説明欄やメモ欄などに「このレコードを削除して」のような Claude への
+指示文が書かれていると、Claude がそれに従おうとすることがあります
+（プロンプトインジェクション）。このため、作成・更新・削除のツールは
+「常に許可」にせず、Claude が実行しようとしている内容が自分の依頼どおりかを
+毎回確認してください。
+
+カスタムオブジェクトも API 参照名（例: MyObject__c）で同じように操作できます。
+項目名がわからないときは、Claude が sf_describe_object で調べてから作成・更新します。
+
+
+----------------------------------------------------------------
+■ トラブルシューティング
+----------------------------------------------------------------
+
+【npm run check やツール実行で出るエラー】
+
+  ・環境変数 SF_… が設定されていません
+      原因: .env がない、または場所が違う
+      対処: ~/dev/salesforce-mcp/.env にあるか ls -a で確認
+
+  ・接続できません (ENOTFOUND)
+      原因: SF_LOGIN_URL の打ち間違い
+      対処: 2-1 の URL をコピーし直す
+
+  ・request not supported on this domain
+      原因: login.salesforce.com を使っている
+      対処: My Domain の URL に変える
+
+  ・invalid_client_id / client identifier invalid
+      原因: コンシューマー鍵の誤り、または設定の反映待ち
+      対処: 鍵をコピーし直す。10分ほど待って再実行
+
+  ・invalid_client / invalid client credentials
+      原因: コンシューマーの秘密の誤り
+      対処: 秘密をコピーし直す（前後の空白に注意）
+
+  ・no client credentials user enabled
+      原因: 実行ユーザーが未設定
+      対処: 2-3 の「別のユーザーとして実行」を設定
+
+  ・HTTP 404 / NOT_FOUND
+      原因: オブジェクト名・ID の誤り、削除済み
+      対処: 名前と ID を確認
+
+  ・INVALID_FIELD / No such column
+      原因: 項目名の誤り
+      対処: Claude に「項目一覧を調べてからやり直して」と伝える
+
+  ・REQUIRED_FIELD_MISSING
+      原因: 必須項目が足りない
+      対処: 必須項目の値も渡す
+
+  ・INSUFFICIENT_ACCESS / INVALID_TYPE
+      原因: 実行ユーザーの権限不足、またはそのオブジェクトが API の操作に
+            対応していない（例: 履歴オブジェクトは参照のみ、User は削除不可）
+      対処: 権限・オブジェクトの仕様を確認
+
+【Claude Desktop に表示されない・接続できない】
+
+  1. ⌘Q で完全に終了してから起動したか確認する
+
+  2. 設定ファイルが正しい JSON か確認する
+     （正しければ OK と登録済みのサーバー名が表示され、壊れていれば SyntaxError が
+     出ます。ほかのサーバーの API キーなどを表示しないよう、中身は出しません）
+
+node -e 'const c=JSON.parse(require("fs").readFileSync(require("os").homedir()+"/Library/Application Support/Claude/claude_desktop_config.json","utf8"));console.log("OK:",Object.keys(c.mcpServers??{}).join(", "))'
+
+  3. サーバーのログを見る
+     （Claude Desktop が起動したサーバーの出力が記録されています）
+
+  tail -n 50 ~/Library/Logs/Claude/mcp-server-salesforce.log
+
+     - spawn node ENOENT
+         → command が絶対パスになっていない（Step 6-A をやり直す）
+     - Cannot find module …/dist/index.js
+         → ビルドしていない、またはパス違い（npm run build を実行）
+     - Operation not permitted
+         → プロジェクトを書類やデスクトップに置いている（~/dev に移す）
+
+  4. ターミナルで直接起動してみる。「[salesforce-mcp] stdio で起動しました」と
+     出て入力待ちになればサーバー自体は正常です（control + C で終了）。
+
+  node ~/dev/salesforce-mcp/dist/index.js
+
+【あとで変更するとき】
+
+  変更したもの                         やること
+  -----------------------------------  ----------------------------------------------
+  src/ のコード（ツール追加など）      npm run build → Claude Desktop を ⌘Q で終了して再起動
+  .env（接続先や鍵）                   Claude Desktop を ⌘Q で終了して再起動
+  claude_desktop_config.json           Claude Desktop を ⌘Q で終了して再起動
+
+【参考】
+
+  - MCP TypeScript SDK v2 ドキュメント
+    https://ts.sdk.modelcontextprotocol.io/v2/
+  - Connect to local MCP servers（Claude Desktop の設定）
+    https://modelcontextprotocol.io/docs/develop/connect-local-servers
+  - Salesforce: クライアントログイン情報フロー用の外部クライアントアプリ作成
+    https://developer.salesforce.com/docs/industries/loyalty/guide/authorization.html
+  - Salesforce Spring '26 リリース（接続アプリの制限）
+    https://www.salesforce.com/blog/spring-26-release-architect-highlights/

@@ -1,0 +1,12 @@
+# 秘密情報（Salesforce の接続情報）
+.env
+.env.*
+
+# 自動生成（npm install / npm run build で再作成できる）
+node_modules/
+dist/
+
+# ログ・macOS が作るファイル
+*.log
+npm-debug.log*
+.DS_Store
